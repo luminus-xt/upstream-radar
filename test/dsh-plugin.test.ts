@@ -48,7 +48,7 @@ describe('DSH radar plugin adapter', () => {
     const state = emptyRadarState()
     state.pendingAnalysisTasks.push(task)
     const messages: unknown[] = []
-    const remaining = deliverPendingAnalysisTasks(state, { followup: message => messages.push(message) })
+    const remaining = deliverPendingAnalysisTasks(state, { session: { header: { cwd: '/workspace/project-a' } }, followup: message => messages.push(message) })
 
     assert.equal(remaining.pendingAnalysisTasks.length, 0)
     assert.equal(messages.length, 1)
@@ -95,7 +95,7 @@ describe('DSH radar plugin adapter', () => {
     const state = emptyRadarState()
     state.pendingAnalysisTasks.push(dshAgent, unrelated, dshSession)
     const messages: Array<{ content: Array<{ text: string }>; source: { summary: string } }> = []
-    const remaining = deliverPendingAnalysisTasks(state, { followup: message => messages.push(message) })
+    const remaining = deliverPendingAnalysisTasks(state, { session: { header: { cwd: '/workspace/project-a' } }, followup: message => messages.push(message) })
     assert.equal(remaining.pendingAnalysisTasks.length, 0)
     assert.equal(messages.length, 2)
     assert.match(messages[0]?.content[0]?.text ?? '', /@deepseek-ai\/dsh-agent/)
@@ -140,7 +140,7 @@ describe('DSH radar plugin adapter', () => {
     const task = createAnalysisTask(event)
     const state = emptyRadarState()
     state.pendingAnalysisTasks.push(task)
-    const agent = { followup: () => undefined }
+    const agent = { session: { header: { cwd: '/workspace/project-a' } }, followup: () => undefined }
     const policy = new Map([['project-a', {
       quietHours: { timezone: 'Asia/Shanghai', start: '22:00', end: '08:00' },
     }]])
@@ -170,7 +170,7 @@ describe('DSH radar plugin adapter', () => {
       [event.incidentId]: { eventId: event.id, mutedUntil: '2026-08-17T00:00:00.000Z' },
     }
     const messages: unknown[] = []
-    const agent = { followup: (message: unknown) => messages.push(message) }
+    const agent = { session: { header: { cwd: '/workspace/project-a' } }, followup: (message: unknown) => messages.push(message) }
     const held = deliverPendingAnalysisTasksToAgents(
       state,
       [agent],
@@ -213,13 +213,42 @@ describe('DSH radar plugin adapter', () => {
     assert.equal(selectDshAgentForProject(event.project, matches), undefined)
   })
 
-  it('preserves single-root compatibility even without session metadata', () => {
+  it('preserves single-root compatibility for a project without a configured workspace', () => {
+    // Legacy branch: no workspace in the project config, so the single root
+    // stays the backwards-compatible default regardless of its cwd.
+    const legacyEvent: CompatibilityEvent = {
+      ...event,
+      project: { id: 'project-a', name: 'Project A' },
+    }
+    const state = emptyRadarState()
+    state.pendingAnalysisTasks.push(createAnalysisTask(legacyEvent))
+    const messages: unknown[] = []
+    const remaining = deliverPendingAnalysisTasksToAgents(state, [{ followup: (message: unknown) => messages.push(message) }])
+
+    assert.equal(remaining.pendingAnalysisTasks.length, 0)
+    assert.equal(messages.length, 1)
+  })
+
+  it('refuses the single-root fallback when the project configures a workspace', () => {
+    // A boot-restore race can leave an unrelated session as the only live
+    // root; with a configured workspace the exact-match rule must hold even
+    // then, or every analysis task is misdelivered into that session.
     const state = emptyRadarState()
     state.pendingAnalysisTasks.push(createAnalysisTask(event))
     const messages: unknown[] = []
-    const remaining = deliverPendingAnalysisTasksToAgents(state, [{ followup: message => messages.push(message) }])
+    const captain = { session: { header: { cwd: '/workspace/unrelated' } }, followup: (message: unknown) => messages.push(message) }
 
-    assert.equal(remaining.pendingAnalysisTasks.length, 0)
+    // Single root, wrong workspace: refuse (task stays durable).
+    assert.equal(selectDshAgentForProject(event.project, [captain]), undefined)
+    const remaining = deliverPendingAnalysisTasksToAgents(state, [captain])
+    assert.equal(remaining.pendingAnalysisTasks.length, 1)
+    assert.equal(messages.length, 0)
+
+    // Single root, matching workspace: still delivered.
+    const receiver = { session: { header: { cwd: '/workspace/project-a' } }, followup: (message: unknown) => messages.push(message) }
+    assert.equal(selectDshAgentForProject(event.project, [receiver]), receiver)
+    const delivered = deliverPendingAnalysisTasksToAgents(state, [receiver])
+    assert.equal(delivered.pendingAnalysisTasks.length, 0)
     assert.equal(messages.length, 1)
   })
 })
