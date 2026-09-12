@@ -178,7 +178,7 @@ export class OsvClient {
 
   private async fetchJson(path: string, init?: RequestInit): Promise<unknown> {
     const url = new URL(path, this.baseUrl)
-    return boundedJson(await this.fetcher(url, {
+    const request = async (): Promise<unknown> => boundedJson(await this.fetcher(url, {
       ...init,
       headers: {
         accept: 'application/json',
@@ -188,6 +188,14 @@ export class OsvClient {
       },
       signal: AbortSignal.timeout(this.timeoutMs),
     }))
+    // One immediate retry absorbs transient network blips and 5xx hiccups.
+    // A second failure still fails the whole query, so no unverified
+    // "safe-looking" state is ever produced from a broken channel.
+    try {
+      return await request()
+    } catch {
+      return await request()
+    }
   }
 
   async query(input: readonly PackageCoordinate[]): Promise<Map<string, AdvisoryMatch[]>> {

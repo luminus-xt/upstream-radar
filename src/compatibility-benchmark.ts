@@ -157,7 +157,10 @@ const cases: readonly BenchmarkCase[] = [
 
 function policyOutcome(event: CompatibilityEvent | undefined, threshold: RadarCompatibilityFailThreshold): BenchmarkOutcome {
   const state = emptyRadarState()
-  if (event !== undefined) {
+  // Informational release notices (benign newer candidates, zero signals)
+  // never enter the incident map: pollRadar routes them as separate notices,
+  // so they must not trip the CI/policy gate either.
+  if (event !== undefined && event.informational !== true) {
     state.activeCompatibility[event.incidentId] = { key: event.incidentId, event }
   }
   return evaluateRadarPolicy(state, 'never', threshold).status === 'fail' ? 'fail' : 'pass'

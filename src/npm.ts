@@ -497,10 +497,24 @@ export async function resolveNpmDependencyGraph(
     await writeFile(join(root, 'controlled.gitconfig'), '', { mode: 0o600 })
     const environment = safeEnvironment(root)
     const npm = process.platform === 'win32' ? 'npm.cmd' : 'npm'
-    const resolution = await runProcess(npm, [
+    const installArgs = [
       'install', '--package-lock-only', '--ignore-scripts', '--no-audit', '--no-fund', '--save-exact', '--loglevel=error',
       '--registry', registry,
-    ], root, environment, timeoutMs)
+    ]
+    let resolution = await runProcess(npm, installArgs, root, environment, timeoutMs)
+    if (resolution.code !== 0 || resolution.timedOut) {
+      // 隔离解析的 peer 树冲突（ERESOLVE）或缺满足版本的 peer（ETARGET）会让
+      // strict 解析整棵失败——registry 上版本常在、真实安装也能成（peer 由宿主层
+      // 提供）。Retry with npm's legacy peer mode (same pattern as deepAudit):
+      // peers are not force-installed into the quarantine, missing/conflicting
+      // peer edges surface as unresolved instead of failing the whole graph.
+      // lifecycle scripts stay disabled; the resulting graph honestly reports
+      // unresolved peer edges (incomplete), never checked-as-if-strict.
+      const legacyResolution = await runProcess(npm, [...installArgs, '--legacy-peer-deps'], root, environment, timeoutMs)
+      if (legacyResolution.code === 0 && !legacyResolution.timedOut && !legacyResolution.outputExceeded) {
+        resolution = legacyResolution
+      }
+    }
     if (resolution.code !== 0 || resolution.timedOut || resolution.outputExceeded) {
       const reason = resolution.timedOut
         ? 'npm candidate dependency resolution timed out'

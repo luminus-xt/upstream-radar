@@ -329,6 +329,10 @@ export interface CompatibilityEvent extends RadarEventBase {
   installed: PackageCoordinate
   candidate: PackageCoordinate
   signals: CompatibilitySignal[]
+  /** True for a benign newer candidate: zero compatibility signals. Such
+   * events are informational release notices only — they never enter the
+   * incident/analysis/delivery state machine. */
+  informational?: boolean
   upgradePath?: CompatibilityUpgradePath
   releaseNotes?: string
   releaseNotesUrl?: string
@@ -388,6 +392,12 @@ export interface AnalysisDeliveryTaskReference {
   taskId: string
   incidentId: string
   eventId: string
+  /**
+   * Identity of the question this reference asks, computed when the task was
+   * delivered. Deliveries written before this field existed fall back to
+   * `eventId`.
+   */
+  questionKey?: string
 }
 
 /** Durable proof that one exact Radar message was admitted to one DSH session. */
