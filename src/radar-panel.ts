@@ -10,6 +10,7 @@
  *   GET  /@dsh-external/upstream-radar/api/inventory  → 当前监控清单（插件×版本×图规模）
  *   GET  /@dsh-external/upstream-radar/api/releases   → 上游新版本（良性通知 + 兼容风险）
  *   POST /@dsh-external/upstream-radar/api/upgrade-request → 手动升级/评估（转发消息给接收会话，host 不安装）
+ *   GET  /@dsh-external/upstream-radar/api/upgrade-target  → 只读诊断：当前会投给哪个会话（不投递、不安装）
  *   GET  /@dsh-external/upstream-radar/api/jobs       → 后台 job 列表
  *   GET  /@dsh-external/upstream-radar/api/job?id=    → 单个 job 进度/结果
  *   POST /@dsh-external/upstream-radar/api/refresh    → 主动触发一轮全链（poll+保存+投递）
@@ -78,6 +79,29 @@ export interface RadarPanelOptions {
     toVersion: string
     kind: 'upgrade' | 'assess'
   }): Promise<{ delivered: boolean; note?: string }>
+  /**
+   * 只读诊断（由 upstream-radar apply 注入）：报告当前 [升级]/[评估] 会投递给
+   * 哪个会话，**不投递任何消息、不执行安装**。用于在点按钮前确认选靶结果
+   * （例如同一 workspace 里存在侧栏不可见的空白草稿时）。
+   * 未注入时该路由返回 503。
+   */
+  upgradeTarget?(): Promise<UpgradeTargetReport>
+}
+
+/**
+ * 面板升级目标的只读诊断结果（`GET /api/upgrade-target`）。
+ */
+export interface UpgradeTargetReport {
+  /** 解析出的目标 workspace；配置缺失时为 null。 */
+  workspace: string | null
+  /** cwd 归一化后精确命中的活跃根会话数。 */
+  matches: number
+  /** 命中里已经跑过至少一个 turn 的数量（DSH 语义的非空白会话）。 */
+  engaged: number
+  /** 当前会选中的会话 id；无法唯一确定时为 null。 */
+  sessionId: string | null
+  /** 人可读的判定说明（选中的理由或拒绝的理由）。 */
+  reason: string
 }
 
 export type JobKind = 'inspect' | 'review' | 'refresh'
@@ -584,6 +608,12 @@ export function registerRadarPanelApi(webServer: WebServerLike, opts: RadarPanel
       json(res, 500, { error: error instanceof Error ? error.message : String(error) })
     }
   })
+  // 只读诊断：当前 [升级]/[评估] 会投给哪个会话。不投递、不安装，仅报告选靶结果。
+  handle('GET', '/api/upgrade-target', async (_req, res) => {
+    if (opts.upgradeTarget === undefined) { json(res, 503, { error: '升级目标诊断未启用（host 未注入 upgradeTarget）' }); return }
+    json(res, 200, await opts.upgradeTarget())
+  })
+
   handle('GET', '/api/jobs', async (_req, res) => {
     json(res, 200, {
       jobs: Array.from(jobs.values()).map(job => ({

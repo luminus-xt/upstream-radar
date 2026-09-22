@@ -60,6 +60,7 @@ function panel(
     reviewDshVersions: string
     refresh: () => void
     requestUpgrade: (request: { plugin: string; fromVersion: string | null; toVersion: string; kind: 'upgrade' | 'assess' }) => Promise<{ delivered: boolean; note?: string }>
+    upgradeTarget: () => Promise<{ workspace: string | null; matches: number; engaged: number; sessionId: string | null; reason: string }>
   }>,
 ): void {
   registerRadarPanelApi(webServer, {
@@ -98,9 +99,9 @@ describe('radar-panel api', () => {
   it('registers the expected route set', () => {
     const { routes, webServer } = fakeServer()
     panel(webServer, {})
-    assert.equal(routes.length, 13)
+    assert.equal(routes.length, 14)
     const paths = routes.map(r => r.path)
-    for (const suffix of ['/api/status', '/api/events', '/api/tasks', '/api/results', '/api/result-failures', '/api/inventory', '/api/releases', '/api/upgrade-request', '/api/jobs', '/api/job', '/api/refresh', '/api/inspect', '/api/review']) {
+    for (const suffix of ['/api/status', '/api/events', '/api/tasks', '/api/results', '/api/result-failures', '/api/inventory', '/api/releases', '/api/upgrade-request', '/api/upgrade-target', '/api/jobs', '/api/job', '/api/refresh', '/api/inspect', '/api/review']) {
       assert.ok(paths.some(p => p.endsWith(suffix)), `missing route ${suffix}`)
     }
   })
@@ -516,6 +517,45 @@ describe('radar-panel api', () => {
       const res = jsonResponse()
       await route.handler(reqJson('POST', { plugin: 'p', toVersion: '2' }), res)
       assert.equal(res.result().code, 503)
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('upgrade-target reports the selection read-only and returns 503 when not injected', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'radar-panel-target-'))
+    try {
+      const stateFile = join(dir, 'state.json')
+      const configFile = join(dir, 'config.json')
+      const report = {
+        workspace: '/workspace/upgrade',
+        matches: 2,
+        engaged: 1,
+        sessionId: 'session-upgrade',
+        reason: 'selected session-upgrade',
+      }
+      const { routes, webServer } = fakeServer()
+      panel(webServer, {
+        radarDir: dir, configFile, stateFile, cliPath: join(dir, 'cli.js'), jobsDir: join(dir, 'jobs'),
+        upgradeTarget: async () => report,
+      })
+      const route = routes.find(r => r.path.endsWith('/api/upgrade-target'))!
+      const res = jsonResponse()
+      await route.handler({ method: 'GET' } as never, res)
+      assert.equal(res.result().code, 200)
+      assert.deepEqual(res.result().body, report)
+
+      // 只读路由不接受写方法（沿用统一的 method 校验）。
+      const wrong = jsonResponse()
+      await route.handler({ method: 'POST' } as never, wrong)
+      assert.equal(wrong.result().code, 405)
+
+      const second = fakeServer()
+      panel(second.webServer, { radarDir: dir, configFile, stateFile, cliPath: join(dir, 'cli.js'), jobsDir: join(dir, 'jobs') })
+      const route2 = second.routes.find(r => r.path.endsWith('/api/upgrade-target'))!
+      const missing = jsonResponse()
+      await route2.handler({ method: 'GET' } as never, missing)
+      assert.equal(missing.result().code, 503)
     } finally {
       await rm(dir, { recursive: true, force: true })
     }

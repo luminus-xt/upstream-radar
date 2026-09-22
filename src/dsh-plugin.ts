@@ -58,7 +58,7 @@ import {
   type AnalysisResultFailure,
   type DroppedAnalysisAnswerOutcome,
 } from './analysis-result-failures.js'
-import { registerRadarPanelApi, type RadarPanelOptions } from './radar-panel.js'
+import { registerRadarPanelApi, type RadarPanelOptions, type UpgradeTargetReport } from './radar-panel.js'
 
 export const name = 'upstream-radar'
 export const inject = ['agents']
@@ -844,6 +844,86 @@ export function selectDshAgentForProject(
   return matches.length === 1 ? matches[0] : undefined
 }
 
+/** DSH 的 blank 规则：一次 turn/start 之后就不再是“新建会话”草稿。 */
+function sessionHasTurn(session: DshSessionLike | undefined): boolean {
+  if (session === undefined) return false
+  return sessionEventsOf(session).some(event => event.type === 'turn/start')
+}
+
+/** 会话日志里最后一个事件的时间（空白草稿之间的确定性排序用）。 */
+function sessionLastEventTime(session: DshSessionLike | undefined): number {
+  if (session === undefined) return 0
+  return sessionEventsOf(session).reduce((latest, event) => {
+    const time = typeof event.time === 'number' && Number.isFinite(event.time) ? event.time : 0
+    return time > latest ? time : latest
+  }, 0)
+}
+
+export interface UpgradeTargetSelection {
+  agent?: DshAgentLike | undefined
+  /** cwd 归一化后精确命中该 workspace 的活跃根会话数。 */
+  matches: number
+  /** 命中里已经跑过至少一个 turn 的数量（DSH 语义的非空白会话）。 */
+  engaged: number
+}
+
+/**
+ * 选择面板 [升级]/[评估] 的投递会话。
+ *
+ * 与分析任务投递刻意分开：分析投递是无人值守的持久任务，误投比延迟更糟
+ * （见 selectDshAgentForProject 的说明）；而面板点击是用户在场、结果可见的手动
+ * 动作，不应因为同一 workspace 里多了一张**侧栏不可见的空白草稿**（Web 客户端
+ * 为每个工作区保留的“新建会话”行，登录后重建/复用）而永久失效。
+ *
+ *   - cwd 归一化后必须精确相等；
+ *   - 恰好一个命中 → 就是它；
+ *   - 多个命中里恰好一个“跑过 turn” → 选它，忽略空白草稿；
+ *   - 多个命中都“跑过 turn” → 不猜，返回 undefined；
+ *   - 全部是空白草稿 → 取最近有事件的那个（草稿没有别的工作在做）。
+ */
+export function selectUpgradeAgentForWorkspace(
+  workspace: string | undefined,
+  agents: readonly DshAgentLike[],
+): UpgradeTargetSelection {
+  const normalized = normalizedWorkspace(workspace)
+  if (normalized === undefined) {
+    // 未配置 workspace 时保持旧行为：只有单根会话才可路由。
+    const engaged = agents.filter(agent => sessionHasTurn(agent.session)).length
+    if (agents.length === 1) return { agent: agents[0], matches: 1, engaged }
+    return { matches: agents.length, engaged }
+  }
+  const matches = agents.filter((agent) => {
+    const cwd = agent.session?.header?.cwd
+    return typeof cwd === 'string' && normalizedWorkspace(cwd) === normalized
+  })
+  if (matches.length === 0) return { matches: 0, engaged: 0 }
+  const engaged = matches.filter(agent => sessionHasTurn(agent.session))
+  if (engaged.length === 1) return { agent: engaged[0], matches: matches.length, engaged: 1 }
+  if (engaged.length > 1) return { matches: matches.length, engaged: engaged.length }
+  const ranked = [...matches].sort((left, right) =>
+    sessionLastEventTime(right.session) - sessionLastEventTime(left.session)
+    || String(left.id ?? left.session?.id ?? '').localeCompare(String(right.id ?? right.session?.id ?? '')))
+  return { agent: ranked[0], matches: matches.length, engaged: 0 }
+}
+
+/** 选中目标的人可读说明（按钮回执与诊断路由共用）。 */
+export function upgradeSelectionNote(selection: UpgradeTargetSelection): string {
+  const session = selection.agent?.id ?? selection.agent?.session?.id ?? '(unknown session)'
+  return selection.engaged > 0
+    ? `已选中升级会话 ${session}（该 workspace 有 ${selection.matches} 个活跃会话，其中 ${selection.engaged} 个已使用过）`
+    : `已选中该 workspace 的空白会话 ${session}（暂无已使用过的会话，请确认这是你要的会话）`
+}
+
+/** 未能唯一确定目标时的说明（按钮回执与诊断路由共用）。 */
+export function upgradeRefusalNote(selection: UpgradeTargetSelection, workspace: string | undefined): string {
+  const label = workspace ?? '(未配置)'
+  if (selection.matches === 0) return `升级会话不在线：workspace ${label} 下没有活跃会话`
+  if (selection.engaged >= 2) {
+    return `workspace ${label} 下有 ${selection.engaged} 个已使用过的活跃会话（共 ${selection.matches} 个），无法唯一确定升级目标：请关掉多余的会话后重试`
+  }
+  return `workspace ${label} 下有 ${selection.matches} 个活跃会话，无法唯一确定升级目标`
+}
+
 type DeliveryObserver = (delivery: AnalysisDelivery, phase: 'before' | 'accepted' | 'rejected') => void
 
 /** Deliver grouped tasks to the matching DSH root; unroutable tasks stay queued. */
@@ -1189,6 +1269,40 @@ export function apply(ctx: DshRadarContext, config: Config = {}): void {
 
   // 可视化面板：可选注册 HTTP 路由（webServer 能力存在时）。挂 ctx.effect，
   // 热重载/卸载自动注销；webServer 缺失时静默降级（监控照常运行）。
+  // 投递目标：优先「专用升级会话」（upgradeWorkspace）；未配置时才回退到项目会话。
+  // 配置了但找不到 → 明确失败，绝不回退到雷达接收会话（那应是只读会话）。
+  const upgradeWorkspaceRef = async (): Promise<{ workspace: string | undefined } | { failure: string }> => {
+    const configuredWorkspace = config.upgradeWorkspace?.trim()
+    if (configuredWorkspace !== undefined && configuredWorkspace !== '') return { workspace: configuredWorkspace }
+    try {
+      const configured = await readConfig(configFile)
+      const project: ProjectReference | undefined = configured.projects[0]?.project
+      if (project === undefined) return { failure: 'radar 配置无项目引用，且未配置 upgradeWorkspace，无法路由升级请求' }
+      return { workspace: project.workspace }
+    } catch (error: unknown) {
+      return { failure: `读取 radar 配置失败：${safeMessage(error)}` }
+    }
+  }
+
+  // 只读诊断通道：报告选靶结果，不投递任何消息（GET /api/upgrade-target）。
+  const inspectUpgradeTarget = async (): Promise<UpgradeTargetReport> => {
+    const reference = await upgradeWorkspaceRef()
+    if ('failure' in reference) {
+      return { workspace: null, matches: 0, engaged: 0, sessionId: null, reason: reference.failure }
+    }
+    const selection = selectUpgradeAgentForWorkspace(reference.workspace, ctx.agents.roots())
+    const agent = selection.agent
+    return {
+      workspace: reference.workspace ?? null,
+      matches: selection.matches,
+      engaged: selection.engaged,
+      sessionId: agent === undefined ? null : (agent.id ?? agent.session?.id ?? null),
+      reason: agent === undefined
+        ? upgradeRefusalNote(selection, reference.workspace)
+        : upgradeSelectionNote(selection),
+    }
+  }
+
   // 用户经面板手动触发的升级/评估请求：只把消息发给接收会话，host 不执行安装。
   const requestUpgrade = async (request: {
     plugin: string
@@ -1196,39 +1310,19 @@ export function apply(ctx: DshRadarContext, config: Config = {}): void {
     toVersion: string
     kind: 'upgrade' | 'assess'
   }): Promise<{ delivered: boolean; note?: string }> => {
-    const agents = ctx.agents.roots()
-    if (agents.length === 0) return { delivered: false, note: '当前没有活跃的 agent 会话（升级会话不在线）' }
-    // 投递目标：优先「专用升级会话」（upgradeWorkspace）；未配置时才回退到项目会话。
-    // 配置了但找不到 → 明确失败，绝不回退到雷达接收会话（那应是只读会话）。
-    const configuredWorkspace = config.upgradeWorkspace?.trim()
-    let target: { id: string; name: string; workspace?: string }
-    if (configuredWorkspace !== undefined && configuredWorkspace !== '') {
-      target = { id: 'panel-upgrade', name: 'panel upgrade session', workspace: configuredWorkspace }
-    } else {
-      let project: ProjectReference | undefined
-      try {
-        const configured = await readConfig(configFile)
-        project = configured.projects[0]?.project
-      } catch (error: unknown) {
-        return { delivered: false, note: `读取 radar 配置失败：${safeMessage(error)}` }
-      }
-      if (project === undefined) return { delivered: false, note: 'radar 配置无项目引用，且未配置 upgradeWorkspace，无法路由升级请求' }
-      target = project
-    }
-    const agent = selectDshAgentForProject(target as ProjectReference, agents)
-    if (agent === undefined) {
-      return {
-        delivered: false,
-        note: `升级会话不在线：请先在 workspace ${target.workspace ?? '(未配置)'} 开一个会话（standard preset），再点按钮`,
-      }
-    }
+    const reference = await upgradeWorkspaceRef()
+    if ('failure' in reference) return { delivered: false, note: reference.failure }
+    const selection = selectUpgradeAgentForWorkspace(reference.workspace, ctx.agents.roots())
+    const agent = selection.agent
+    if (agent === undefined) return { delivered: false, note: upgradeRefusalNote(selection, reference.workspace) }
     try {
       agent.followup(upgradeRequestMessage(request))
     } catch (error: unknown) {
       return { delivered: false, note: `投递失败：${safeMessage(error)}` }
     }
-    ctx.logger.info(`upstream-radar: panel ${request.kind} request delivered to ${target.workspace ?? 'project session'} (${request.plugin} -> ${request.toVersion})`)
-    return { delivered: true }
+    const note = upgradeSelectionNote(selection)
+    ctx.logger.info(`upstream-radar: panel ${request.kind} request delivered to ${reference.workspace ?? 'project session'} (${request.plugin} -> ${request.toVersion}); ${note}`)
+    return { delivered: true, note }
   }
 
   const panelOptions: RadarPanelOptions = {
@@ -1241,6 +1335,7 @@ export function apply(ctx: DshRadarContext, config: Config = {}): void {
     reviewDshVersions: config.panelReviewDshVersions ?? '0.1.1-rc.2,0.1.2-alpha.5',
     refresh: () => refreshHook.run(),
     requestUpgrade,
+    upgradeTarget: inspectUpgradeTarget,
   }
   const panelContext = ctx as unknown as {
     inject?: (deps: string[], fn: (scope: {
