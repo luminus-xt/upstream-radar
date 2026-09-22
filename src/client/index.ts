@@ -214,11 +214,21 @@ const EventCard = (e: EventRow) => jsxs('div', { style: styles.card, children: [
   jsx(EvaluatedLine, { ...e }),
 ] })
 
-/** 监控插件清单中的一个 chip（有活跃事件的插件高亮）。 */
-const InvChip = (row: InventoryRow, hasEvent: boolean) => jsxs('span', { style: styles.invChip(hasEvent), children: [
-  jsx('span', { style: styles.invName, children: row.name }),
-  jsx('span', { style: styles.invMeta, children: `${row.version ?? '?'} · ${row.graphNodes ?? 0}n/${row.graphEdges ?? 0}e${hasEvent ? ' · ⚠' : ''}` }),
-] })
+/**
+ * 监控插件清单中的一个 chip（有活跃事件的插件高亮）。
+ *
+ * 必须以**单个 props 对象**接收：React 只按 `(props, legacyContext)` 调用函数组件，
+ * 写成 `(row, hasEvent)` 时第二个参数恒为 legacy context（`{}`，恒真），
+ * 会让每个 chip 都带 ⚠ 并全部走高亮样式。判定用 `=== true` 兜底非布尔入参。
+ */
+const InvChip = (props: InventoryRow & { hasEvent: boolean }) => {
+  const { hasEvent, ...row } = props
+  const active = hasEvent === true
+  return jsxs('span', { style: styles.invChip(active), children: [
+    jsx('span', { style: styles.invName, children: row.name }),
+    jsx('span', { style: styles.invMeta, children: `${row.version ?? '?'} · ${row.graphNodes ?? 0}n/${row.graphEdges ?? 0}e${active ? ' · ⚠' : ''}` }),
+  ] })
+}
 
 /** 上游新版本行：插件、版本跨度、风险徽标，以及手动 [升级]/[让 agent 评估] 按钮。 */
 const ReleaseLine = (props: ReleaseRow & { onRequest?: (row: ReleaseRow, kind: 'upgrade' | 'assess') => void }) => {
@@ -302,7 +312,13 @@ function RadarPanel() {
   // 有活跃事件的监控插件集合（用于清单高亮）。
   const activePackages = React.useMemo(() => {
     const set = new Set<string>()
-    for (const e of events) if (e.package) set.add(e.package.split('@')[0] ?? e.package)
+    for (const e of events) {
+      if (!e.package) continue
+      // 只剥**尾部**版本号：scoped 名（@scope/name@1.2.3）用 split('@')[0] 会得到空串，
+      // 导致 scoped 包永远点不亮（2026-09-18 修复）。
+      const at = e.package.lastIndexOf('@')
+      set.add(at > 0 ? e.package.slice(0, at) : e.package)
+    }
     return set
   }, [events])
 
