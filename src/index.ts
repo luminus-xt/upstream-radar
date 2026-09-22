@@ -39,7 +39,15 @@ export {
   discoverDshRuntimePackageFromNodeModulesDirectory,
 } from './dsh-runtime.js'
 export { OsvClient, packageKey, type OsvClientOptions } from './osv.js'
-export { NpmReleaseClient, type NpmReleaseCandidateStatus, type NpmReleaseClientOptions, type NpmReleaseObservation } from './npm-release.js'
+export {
+  NpmReleaseClient,
+  isTransientNpmReleaseFailure,
+  type NpmReleaseCandidateStatus,
+  type NpmReleaseClientOptions,
+  type NpmReleaseObservation,
+  type NpmReleaseQueryFailure,
+  type NpmReleaseQueryResult,
+} from './npm-release.js'
 export { MAX_CANDIDATE_GRAPHS, NpmCandidateGraphClient, type NpmCandidateGraphClientOptions } from './npm-candidate.js'
 export { GitHubReleaseClient, type GitHubReleaseClientOptions, type ReleaseNotes, type ReleaseNotesSource } from './github-release.js'
 export { GitHubAdvisoryClient, type GitHubAdvisoryClientOptions } from './github-advisory.js'
@@ -526,3 +534,8 @@ export {
   type VulnerabilityEvent,
   type WebhookDeliveryState,
 } from './radar-types.js'
+
+// DSH 插件面（host bundle 以裸包名 `upstream-radar` 加载）：复用 ./dsh-plugin 的
+// Cordis 入口，使 `.` 同时可作 host 插件装载，从而被 client-modules 扫描到 `dsh.client`
+// （client 发现要求裸包名 loader 行；子路径 `upstream-radar/dsh` 无法归位到根包）。
+export { apply, inject, name } from './dsh-plugin.js'

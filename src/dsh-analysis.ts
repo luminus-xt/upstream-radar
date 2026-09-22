@@ -10,6 +10,21 @@ function shortHash(value: string): string {
   return createHash('sha256').update(value).digest('hex').slice(0, 20)
 }
 
+/**
+ * The verdict contract as shown to the model.
+ *
+ * Shared by the task prompt and the correction retry prompt so the two can
+ * never drift apart.
+ */
+export const ANALYSIS_EXPECTED_OUTPUT: AnalysisTask['expectedOutput'] = {
+  project_exposure: 'exposed | likely_exposed | not_exposed | unknown',
+  confidence: 'high | medium | low',
+  evidence: 'array of repository paths, symbols, configuration, or runtime facts',
+  recommended_action: 'project-specific next action',
+  urgency: 'immediate | within_24_hours | planned | monitor',
+  reasoning_summary: 'short explanation separating deterministic facts from model analysis',
+}
+
 export function createAnalysisTask(event: RadarEvent): AnalysisTask {
   return {
     schema: ANALYSIS_TASK_SCHEMA,
@@ -21,14 +36,7 @@ export function createAnalysisTask(event: RadarEvent): AnalysisTask {
       readOnly: true,
       requireProjectEvidence: true,
     },
-    expectedOutput: {
-      project_exposure: 'exposed | likely_exposed | not_exposed | unknown',
-      confidence: 'high | medium | low',
-      evidence: 'array of repository paths, symbols, configuration, or runtime facts',
-      recommended_action: 'project-specific next action',
-      urgency: 'immediate | within_24_hours | planned | monitor',
-      reasoning_summary: 'short explanation separating deterministic facts from model analysis',
-    },
+    expectedOutput: { ...ANALYSIS_EXPECTED_OUTPUT },
   }
 }
 

@@ -253,6 +253,9 @@ function validAnalysisDelivery(value: unknown): value is AnalysisDelivery {
       || typeof reference.taskId !== 'string' || reference.taskId.length === 0 || reference.taskId.length > 256
       || typeof reference.incidentId !== 'string' || reference.incidentId.length === 0 || reference.incidentId.length > 512
       || typeof reference.eventId !== 'string' || reference.eventId.length === 0 || reference.eventId.length > 512
+      || (reference.questionKey !== undefined
+        && (typeof reference.questionKey !== 'string'
+          || reference.questionKey.length === 0 || reference.questionKey.length > 1_024))
       || known.has(reference.taskId)) return false
     known.add(reference.taskId)
     return true

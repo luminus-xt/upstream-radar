@@ -52,6 +52,9 @@
       "types": "./dist/src/dsh-plugin.d.ts",
       "import": "./dist/src/dsh-plugin.js"
     },
+    "./client": {
+      "default": "./lib/client.js"
+    },
     "./cordis.patch.yml": {
       "default": "./cordis.patch.yml"
     }
@@ -70,6 +73,7 @@
   ],
   "scripts": {
     "build": "tsc -p tsconfig.json",
+    "build:client": "bash scripts/build-client.sh",
     "cli": "node dist/src/cli.js",
     "demo": "pnpm run build && node dist/src/cli.js demo",
     "check": "tsc -p tsconfig.json --noEmit",
@@ -122,6 +126,13 @@
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-runtime",
+        "@deepseek-ai/dsh-client-ui-slots"
+      ]
     }
   },
   "devDependencies": {

@@ -4,7 +4,7 @@ import { assessCompatibilityChanges } from './compatibility.js'
 import { findDependencyPaths } from './graph.js'
 import type { ReleaseNotes, ReleaseNotesSource } from './github-release.js'
 import { MAX_CANDIDATE_GRAPHS } from './npm-candidate.js'
-import type { NpmReleaseObservation } from './npm-release.js'
+import type { NpmReleaseObservation, NpmReleaseQueryResult } from './npm-release.js'
 import { compareSemverValues } from './semver.js'
 import { packageKey } from './osv.js'
 import {
@@ -53,7 +53,28 @@ export interface AdvisorySourceBinding {
 }
 
 export interface ReleaseSource {
+  /**
+   * Strict query: any package that cannot be observed fails the whole call.
+   * A successful return therefore proves complete coverage.
+   */
   query(packages: readonly PackageCoordinate[]): Promise<Map<string, NpmReleaseObservation>>
+  /**
+   * Coverage-aware query: a single unreachable package no longer discards the
+   * whole cycle. Optional so existing sources keep working; the fallback below
+   * is sound precisely because the strict `query` above proves full coverage
+   * when it returns.
+   */
+  queryWithCoverage?(packages: readonly PackageCoordinate[]): Promise<NpmReleaseQueryResult>
+}
+
+/** Ask a release source for observations and an explicit coverage report. */
+async function queryReleasesWithCoverage(
+  source: ReleaseSource,
+  packages: readonly PackageCoordinate[],
+): Promise<NpmReleaseQueryResult> {
+  if (source.queryWithCoverage !== undefined) return await source.queryWithCoverage(packages)
+  const releases = await source.query(packages)
+  return { releases, failures: [], attempted: new Set(packages.map(item => item.name)).size }
 }
 
 export interface CandidateDependencySource {
@@ -65,6 +86,10 @@ export interface RadarPollResult {
   packagesQueried: number
   releasePackagesQueried: number
   events: RadarEvent[]
+  /** Benign newer candidates (informational compatibility events). Kept
+   * separate from `events` so release notices never touch incidents,
+   * history, analysis tasks, or deliveries. */
+  notices: RadarEvent[]
   analysisTasks: AnalysisTask[]
   sourceErrors: Array<{ source: RadarSource; message: string }>
   state: RadarState
@@ -566,6 +591,7 @@ export async function pollRadar(
   if (previousState.schema !== RADAR_STATE_SCHEMA) throw new Error('unsupported radar state schema')
   if (!Number.isFinite(now.getTime())) throw new Error('radar check time is invalid')
   const checkedAt = now.toISOString()
+  const notices: RadarEvent[] = []
   const sourceErrors: RadarPollResult['sourceErrors'] = []
   const attemptedSources = new Set<RadarSource>()
   let sourceHealth = { ...(previousState.sourceHealth ?? {}) }
@@ -818,11 +844,18 @@ export async function pollRadar(
       continue
     }
     if (eventChanged(previous.event, item.event)) {
-      events.push({
+      const updated = {
         ...item.event,
         id: eventId(key, 'updated', checkedAt, item.event.advisory.modified),
-        change: 'updated',
-      })
+        change: 'updated' as const,
+      }
+      events.push(updated)
+      // Store the routed event so delivery refs bound to its id remain
+      // reclaimable against the active state until the content changes.
+      current.set(key, { key, event: updated })
+    } else {
+      // Keep the previously stored event and its id on unchanged cycles.
+      current.set(key, previous)
     }
   }
   for (const [key, previous] of Object.entries(previousState.activeVulnerabilities)) {
@@ -864,9 +897,23 @@ export async function pollRadar(
     let releases: Map<string, NpmReleaseObservation>
     let releaseCheckSucceeded = false
     try {
-      releases = await releaseSource.query([...releasePackages.values()])
+      const outcome = await queryReleasesWithCoverage(releaseSource, [...releasePackages.values()])
+      releases = outcome.releases
+      // Partial coverage is NOT a pass (AGENTS.md invariant 10): the source is
+      // reported degraded and the gap is recorded, but the observations that did
+      // arrive still drive this cycle's version comparison instead of being
+      // thrown away with the whole round.
       releaseCheckSucceeded = true
-      sourceHealth = recordSourceHealth(sourceHealth, 'npm-releases', checkedAt, true)
+      if (outcome.failures.length > 0) {
+        const sample = outcome.failures.slice(0, 3).map(failure => `${failure.name}: ${failure.message}`).join('; ')
+        const message = `${outcome.failures.length}/${outcome.attempted} packument(s) unavailable this cycle (${sample})`
+          .replace(/[\u0000-\u001f\u007f-\u009f]/g, '?')
+          .slice(0, 2_048)
+        sourceErrors.push({ source: 'npm-releases', message })
+        sourceHealth = recordSourceHealth(sourceHealth, 'npm-releases', checkedAt, false, message)
+      } else {
+        sourceHealth = recordSourceHealth(sourceHealth, 'npm-releases', checkedAt, true)
+      }
     } catch (error: unknown) {
       const raw = error instanceof Error ? error.message : String(error)
       const message = raw.replace(/[\u0000-\u001f\u007f-\u009f]/g, '?').slice(0, 2_048)
@@ -1063,6 +1110,15 @@ export async function pollRadar(
             ...releaseNotesUrlInput,
           })
           for (const candidateEvent of compatibilityEvents) {
+            if (candidateEvent.kind === 'compatibility' && candidateEvent.informational === true) {
+              // Benign newer candidates (no compatibility signals) surface as
+              // informational release notices only: never enter the incident
+              // map, history, analysis queue, or delivery state machine, so
+              // original monitoring semantics stay unchanged.
+              // [PATCH-20260907-RELEASE-NOTICE]
+              notices.push(candidateEvent)
+              continue
+            }
             currentCompatibility.set(candidateEvent.incidentId, { key: candidateEvent.incidentId, event: candidateEvent })
           }
         }
@@ -1074,17 +1130,44 @@ export async function pollRadar(
           continue
         }
         if (compatibilityEventChanged(previous.event, item.event)) {
-          events.push({
+          const updated = {
             ...item.event,
             id: `event-${hash(`${key}\0updated\0${checkedAt}\0${item.event.candidate.version}`)}`,
-            change: 'updated',
-          })
+            change: 'updated' as const,
+          }
+          events.push(updated)
+          // Store the routed event, not the freshly recomputed one: delivery
+          // refs bind to the routed id, and reclamation compares refs against
+          // the stored active event id. Storing the routed event keeps the two
+          // equal until the content genuinely changes again.
+          currentCompatibility.set(key, { key, event: updated })
+        } else {
+          // An unchanged cycle keeps the previously stored event and its id
+          // instead of re-casting one seeded with the fresh cycle time; ids
+          // then only rotate when the compatibility content actually changes.
+          currentCompatibility.set(key, previous)
         }
       }
       for (const [key, previous] of Object.entries(previousState.activeCompatibility)) {
         if (currentCompatibility.has(key)) continue
         const status = releaseStatuses.get(packageKey(previous.event.installed))
-        if (status === 'older' || status === 'uncomparable') {
+        // A previously active incident can be absent from this cycle for two
+        // very different reasons. When the release feed observed the package
+        // this cycle, `status` tells us the truth (`same` = caught up,
+        // `older`/`uncomparable` = installed is ahead or uncomparable).
+        // When the package produced no observation at all (`undefined`) the
+        // feed either failed or omitted it this cycle — that is a transient
+        // miss, NOT a resolution. Emitting `resolved` here used to close a
+        // still-real candidate and, because resolution deletes the pending
+        // analysis task below, silently drop an undelivered needs-analysis
+        // event (candidate-dependency-check-unavailable incidents churned
+        // new->resolved->new on flaky feeds and were never analyzed).
+        // [PATCH-20260907-RADAR-KEEP-ON-FEED-MISS] Keep the incident on a
+        // failed release check; only a successful feed that observes the
+        // package no longer newer (or no longer lists it at all, i.e. it was
+        // unpublished) resolves the incident.
+        if (status === 'newer' || status === 'older' || status === 'uncomparable'
+          || (status === undefined && !releaseCheckSucceeded)) {
           currentCompatibility.set(key, previous)
           continue
         }
@@ -1191,6 +1274,7 @@ export async function pollRadar(
     packagesQueried: uniquePackages.size,
     releasePackagesQueried: releasePackages.size,
     events,
+    notices,
     analysisTasks,
     sourceErrors,
     state: {

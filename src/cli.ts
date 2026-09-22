@@ -4,6 +4,19 @@ import process from 'node:process'
 import { spawnSync } from 'node:child_process'
 import { access, mkdir, readFile, readdir, stat, writeFile } from 'node:fs/promises'
 import { dirname, join, resolve } from 'node:path'
+import { readAnalysisResultFailures, type AnalysisResultFailure } from './analysis-result-failures.js'
+
+/**
+ * 一行摘要 + 最近一条明细。只在存在未回收答复时输出，保持健康路径的输出不变。
+ */
+function renderDroppedAnswers(failures: readonly AnalysisResultFailure[]): string {
+  if (failures.length === 0) return ''
+  const latest = [...failures].sort((left, right) => right.detectedAt.localeCompare(left.detectedAt))[0]
+  const detail = latest?.detail === undefined ? '' : ` · ${latest.detail}`
+  return `\nDropped answers: ${failures.length} reached the receiving session but failed verdict validation`
+    + ` (latest ${latest?.detectedAt ?? '?'} · ${latest?.outcome ?? '?'}${detail})\n`
+    + `  Details: ${failures.length} entr${failures.length === 1 ? 'y' : 'ies'} in <stateFile>.analysis-result-failures.json\n`
+}
 import { renderCompatibilityBenchmark, runCompatibilityBenchmark } from './compatibility-benchmark.js'
 import { assessCompatibilityChange } from './compatibility.js'
 import { probeDshLoad, probeDshLoadMatrix, renderDshLoadMatrix, renderDshLoadProbe, type DshLoadMatrixReport } from './dsh-probe.js'
@@ -1598,8 +1611,7 @@ async function runRadar(args: readonly string[]): Promise<number> {
   const readConfigForPoll = async () => frozen
     ? readConfig()
     : refreshRadarConfigFromConfiguredProfile(await readConfig())
-  if (subcommand === 'status' || subcommand === 'next') {
-    if (positional.length > 0 || notesPath !== undefined || once || intervalProvided
+  if (subcommand === 'status' || subcommand === 'next') {    if (positional.length > 0 || notesPath !== undefined || once || intervalProvided
       || historyLimitProvided || osvBaseUrl !== undefined || registry !== undefined || webhookUrl !== undefined || !deepCandidates || !githubAdvisories || threatIntel || frozen || statePath === ':memory:'
       || (subcommand === 'next' && (failOn !== 'never' || failOnCompatibility !== 'never'))) {
       throw new Error(subcommand === 'next'
@@ -1622,12 +1634,15 @@ async function runRadar(args: readonly string[]): Promise<number> {
       process.stdout.write(json ? `${JSON.stringify(next, null, 2)}\n` : renderRadarNext(next))
       return 0
     }
+    // 到达但未被接受的答复（verdict 校验失败）：不出现在 state 里，必须单独读 sidecar，
+    // 否则"结论很少"和"答复被丢弃"在 status 上看不出区别。
+    const droppedAnswers = await readAnalysisResultFailures(stateFile)
     if (json) {
       process.stdout.write(!policyEnabled
-        ? `${JSON.stringify(report, null, 2)}\n`
-        : `${JSON.stringify({ ...report, policy }, null, 2)}\n`)
+        ? `${JSON.stringify({ ...report, droppedAnswers }, null, 2)}\n`
+        : `${JSON.stringify({ ...report, policy, droppedAnswers }, null, 2)}\n`)
     } else {
-      process.stdout.write(`${renderRadarStatus(report)}${policyEnabled ? renderRadarPolicy(policy) : ''}`)
+      process.stdout.write(`${renderRadarStatus(report)}${renderDroppedAnswers(droppedAnswers)}${policyEnabled ? renderRadarPolicy(policy) : ''}`)
     }
     if (report.monitoring === 'degraded' || report.coverage === 'incomplete') return 1
     return policy.status === 'fail' ? 2 : 0

@@ -115,12 +115,18 @@ describe('radar polling', () => {
       },
     }
 
+    const storedFor = (state: typeof first.state) => Object.values(state.activeVulnerabilities)
+      .find(item => item.event.incidentId === firstEvent.incidentId)
+    assert.equal(storedFor(first.state)?.event.id, firstEvent.id)
+
     const unchanged = await pollRadar([inventory], first.state, source('2026-08-14T01:00:00.000Z'), new Date('2026-08-14T01:31:00.000Z'))
     assert.equal(unchanged.events.length, 0)
     assert.equal(Object.keys(unchanged.state.analysisResults ?? {}).length, 1)
     assert.equal(unchanged.state.history?.length, 1)
     assert.deepEqual(unchanged.state.incidentMutes, first.state.incidentMutes)
     assert.deepEqual(unchanged.state.incidentTriage, first.state.incidentTriage)
+    // An unchanged cycle must not re-cast the stored vulnerability event id.
+    assert.equal(storedFor(unchanged.state)?.event.id, firstEvent.id)
 
     const updated = await pollRadar([inventory], unchanged.state, source('2026-08-14T02:00:00.000Z'), new Date('2026-08-14T02:01:00.000Z'))
     assert.equal(updated.events[0]?.change, 'updated')
@@ -129,6 +135,10 @@ describe('radar polling', () => {
     assert.equal(updated.state.pendingAnalysisTasks[0]?.event.change, 'updated')
     assert.equal(Object.keys(updated.state.analysisResults ?? {}).length, 0)
     assert.equal(updated.state.history?.length, 2)
+    // The routed updated event is also the stored active event, so a delivery
+    // ref bound to it stays reclaimable until the content changes again.
+    assert.equal(storedFor(updated.state)?.event.id, updated.events[0]?.id)
+    assert.equal(updated.state.pendingAnalysisTasks[0]?.event.id, updated.events[0]?.id)
 
     const resolved = await pollRadar([inventory], updated.state, source('2026-08-14T02:00:00.000Z', false), new Date('2026-08-14T03:01:00.000Z'))
     assert.equal(resolved.events[0]?.change, 'resolved')
@@ -300,6 +310,206 @@ describe('radar polling', () => {
     assert.equal(resolved.events[0]?.change, 'resolved')
     assert.equal(resolved.analysisTasks.length, 0)
     assert.equal(resolved.state.pendingAnalysisTasks.length, 0)
+  })
+
+  it('keeps a compatibility incident and its pending task across a transient release-feed miss, resolving only on real catch-up', async () => {
+    const releases = (latestVersion: string): ReleaseSource => ({
+      async query(packages) {
+        const installed = packages.find(item => item.name === 'plugin')
+        assert.ok(installed)
+        return new Map([['npm:plugin@1.0.0', {
+          installed,
+          latestVersion,
+          previous: { name: 'plugin', version: '1.0.0', main: './old.js' },
+          candidate: { name: 'plugin', version: latestVersion, main: './next.js' },
+        }]])
+      },
+    })
+    const noVulnerabilities = source('2026-08-14T01:00:00.000Z', false)
+    const first = await pollRadar(
+      [inventory],
+      emptyRadarState(),
+      noVulnerabilities,
+      new Date('2026-08-14T06:00:00.000Z'),
+      releases('2.0.0'),
+    )
+    const firstEvent = first.events[0]
+    assert.ok(firstEvent !== undefined)
+    assert.equal(firstEvent.kind, 'compatibility')
+    assert.equal(firstEvent.change, 'new')
+    assert.equal(first.state.pendingAnalysisTasks.length, 1)
+
+    // A feed outage must not masquerade as "candidate gone": the incident
+    // stays active and its undelivered analysis task survives.
+    const outage: ReleaseSource = {
+      async query() {
+        throw new Error('npm registry timed out')
+      },
+    }
+    const missed = await pollRadar(
+      [inventory],
+      first.state,
+      noVulnerabilities,
+      new Date('2026-08-14T06:30:00.000Z'),
+      outage,
+    )
+    assert.equal(missed.events.length, 0)
+    assert.equal(missed.state.pendingAnalysisTasks.length, 1)
+    const stored = Object.values(missed.state.activeCompatibility ?? {})
+      .some(item => item.event.incidentId === firstEvent.incidentId)
+    assert.equal(stored, true)
+
+    // Only a real catch-up (feed observes installed == latest) resolves and
+    // reclaims the task.
+    const resolved = await pollRadar(
+      [inventory],
+      missed.state,
+      noVulnerabilities,
+      new Date('2026-08-14T07:00:00.000Z'),
+      releases('1.0.0'),
+    )
+    const resolvedEvent = resolved.events[0]
+    assert.ok(resolvedEvent !== undefined)
+    assert.equal(resolvedEvent.change, 'resolved')
+    assert.equal(resolved.state.pendingAnalysisTasks.length, 0)
+  })
+
+  it('surfaces benign newer candidates as informational release notices without touching the incident/analysis state machine', async () => {
+    const releases: ReleaseSource = {
+      async query(packages) {
+        const installed = packages.find(item => item.name === 'plugin')
+        assert.ok(installed)
+        return new Map([['npm:plugin@1.0.0', {
+          installed,
+          latestVersion: '1.0.1',
+          previous: { name: 'plugin', version: '1.0.0', main: './lib.js' },
+          candidate: { name: 'plugin', version: '1.0.1', main: './lib.js' },
+          upgradeCandidates: [{ name: 'plugin', version: '1.0.1', main: './lib.js' }],
+        }]])
+      },
+    }
+    const noVulnerabilities = source('2026-08-14T01:00:00.000Z', false)
+    const first = await pollRadar(
+      [inventory],
+      emptyRadarState(),
+      noVulnerabilities,
+      new Date('2026-08-14T08:00:00.000Z'),
+      releases,
+    )
+    // No release notes, peers, or dependency findings => zero signals, so the
+    // candidate must surface ONLY as an informational notice: no events, no
+    // analysis tasks, no history, no active incident, no pending queue.
+    assert.equal(first.events.length, 0)
+    assert.equal(first.analysisTasks.length, 0)
+    assert.equal(first.state.history?.length ?? 0, 0)
+    assert.equal(Object.keys(first.state.activeCompatibility).length, 0)
+    assert.equal(first.state.pendingAnalysisTasks.length, 0)
+    assert.equal(first.notices.length, 1)
+    const notice = first.notices[0]
+    assert.ok(notice !== undefined)
+    assert.equal(notice.kind, 'compatibility')
+    if (notice.kind === 'compatibility') {
+      assert.equal(notice.informational, true)
+      assert.equal(notice.signals.length, 0)
+      assert.equal(notice.candidate.version, '1.0.1')
+    }
+    // The same candidate next poll still never enters the state machine
+    // (delivery dedupe lives in the plugin layer, not in poll).
+    const second = await pollRadar(
+      [inventory],
+      first.state,
+      noVulnerabilities,
+      new Date('2026-08-14T08:30:00.000Z'),
+      releases,
+    )
+    assert.equal(second.events.length, 0)
+    assert.equal(second.notices.length, 1)
+    assert.equal(Object.keys(second.state.activeCompatibility).length, 0)
+    assert.equal(second.state.pendingAnalysisTasks.length, 0)
+  })
+
+  it('keeps the stored compatibility event id aligned with emitted tasks so deliveries stay reclaimable', async () => {
+    const releases: ReleaseSource = {
+      async query(packages) {
+        const installed = packages.find(item => item.name === 'plugin')
+        assert.ok(installed)
+        return new Map([['npm:plugin@1.0.0', {
+          installed,
+          latestVersion: '2.0.0',
+          previous: { name: 'plugin', version: '1.0.0', main: './old.js' },
+          candidate: { name: 'plugin', version: '2.0.0', main: './new.js' },
+          upgradeCandidates: [
+            { name: 'plugin', version: '1.5.0', main: './old.js' },
+            { name: 'plugin', version: '2.0.0', main: './new.js' },
+          ],
+        }]])
+      },
+    }
+    const noVulnerabilities = source('2026-08-14T01:00:00.000Z', false)
+    const first = await pollRadar(
+      [inventory],
+      emptyRadarState(),
+      noVulnerabilities,
+      new Date('2026-08-14T04:00:00.000Z'),
+      releases,
+    )
+    assert.equal(first.events.length, 1)
+    const incidentId = first.events[0]?.incidentId
+    assert.ok(incidentId !== undefined)
+    // The routed event is what a delivery binds to, so it must also be the
+    // stored active event the reclamation path compares refs against.
+    assert.equal(first.state.activeCompatibility[incidentId]?.event.id, first.events[0]?.id)
+
+    const unchanged = await pollRadar(
+      [inventory],
+      first.state,
+      noVulnerabilities,
+      new Date('2026-08-14T04:30:00.000Z'),
+      releases,
+    )
+    assert.equal(unchanged.events.length, 0)
+    // An unchanged cycle must not re-cast the stored id from the fresh cycle
+    // time; otherwise every pending delivery ref expires every poll.
+    assert.equal(unchanged.state.activeCompatibility[incidentId]?.event.id, first.events[0]?.id)
+    assert.equal(unchanged.state.pendingAnalysisTasks[0]?.event.id, first.events[0]?.id)
+
+    const nextRelease: ReleaseSource = {
+      async query(packages) {
+        const installed = packages.find(item => item.name === 'plugin')
+        assert.ok(installed)
+        return new Map([['npm:plugin@1.0.0', {
+          installed,
+          latestVersion: '3.0.0',
+          previous: { name: 'plugin', version: '1.0.0', main: './old.js' },
+          candidate: { name: 'plugin', version: '3.0.0', main: './next.js' },
+        }]])
+      },
+    }
+    const updated = await pollRadar(
+      [inventory],
+      unchanged.state,
+      noVulnerabilities,
+      new Date('2026-08-14T05:00:00.000Z'),
+      nextRelease,
+    )
+    assert.equal(updated.events[0]?.change, 'updated')
+    const routedId = updated.events[0]?.id
+    assert.ok(routedId !== undefined)
+    assert.notEqual(routedId, first.events[0]?.id)
+    // The updated routed event, its pending task, and the stored active event
+    // must share one id while the content stays stable.
+    assert.equal(updated.state.activeCompatibility[incidentId]?.event.id, routedId)
+    assert.equal(updated.state.pendingAnalysisTasks[0]?.event.id, routedId)
+
+    const stableAgain = await pollRadar(
+      [inventory],
+      updated.state,
+      noVulnerabilities,
+      new Date('2026-08-14T05:30:00.000Z'),
+      nextRelease,
+    )
+    assert.equal(stableAgain.events.length, 0)
+    assert.equal(stableAgain.state.activeCompatibility[incidentId]?.event.id, routedId)
   })
 
   it('monitors the exact DSH executable package as a host-runtime release stream', async () => {
@@ -1154,5 +1364,52 @@ describe('radar polling', () => {
     assert.equal(second.events.length, 0)
     assert.equal(Object.values(second.state.activeCompatibility)[0]?.event.releaseNotesUrl, 'https://github.com/acme/plugin/releases/tag/v2.0.0')
     assert.deepEqual(second.sourceErrors, [{ source: 'github-releases', message: 'temporary GitHub failure' }])
+  })
+})
+
+describe('npm release partial coverage', () => {
+  it('keeps the cycle usable while still reporting incomplete coverage', async () => {
+    const partial: ReleaseSource = {
+      async query() {
+        throw new Error('the strict query must not run when coverage is available')
+      },
+      async queryWithCoverage(packages) {
+        const installed = packages.find(item => item.name === 'plugin')
+        assert.ok(installed)
+        return {
+          releases: new Map([['npm:plugin@1.0.0', {
+            installed,
+            latestVersion: '2.0.0',
+            previous: { name: 'plugin', version: '1.0.0', main: './old.js' },
+            candidate: { name: 'plugin', version: '2.0.0', main: './new.js' },
+          }]]),
+          failures: [{ name: 'unreachable-plugin', message: 'fetch failed' }],
+          attempted: 2,
+        }
+      },
+    }
+
+    const result = await pollRadar(
+      [inventory],
+      emptyRadarState(),
+      source('2026-08-14T01:00:00.000Z', false),
+      new Date('2026-08-14T04:00:00.000Z'),
+      partial,
+    )
+
+    // The observations that did arrive still drive this cycle's comparison:
+    // one unreachable package no longer discards the whole round.
+    assert.equal(result.events.length, 1)
+    assert.equal(result.events[0]?.kind, 'compatibility')
+
+    // ...and the gap is reported rather than passed off as complete coverage.
+    assert.equal(result.sourceErrors.length, 1)
+    assert.equal(result.sourceErrors[0]?.source, 'npm-releases')
+    assert.match(String(result.sourceErrors[0]?.message), /1\/2 packument\(s\) unavailable this cycle/)
+    assert.match(String(result.sourceErrors[0]?.message), /unreachable-plugin: fetch failed/)
+    const health = result.state.sourceHealth?.['npm-releases']
+    assert.equal(health?.consecutiveFailures, 1)
+    assert.equal(health?.lastSucceededAt, undefined)
+    assert.match(String(health?.lastError), /1\/2 packument/)
   })
 })
