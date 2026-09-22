@@ -69,7 +69,7 @@ interface ReleaseRow {
   upgradeEvaluated?: number; upgradeBlockedCount?: number; upgradeUnlisted?: number; upgradeVersions?: EvaluatedVersion[]
 }
 interface JobState { id: string; kind: string; status: string; target?: string | null; output?: string; exitCode?: number }
-interface FailureRow { sessionId: string; assistantSeq: number; incidentIds: string[]; detectedAt: string; outcome: string; detail?: string | null; attempt?: number; unrecoverable?: boolean }
+interface FailureRow { sessionId: string; assistantSeq: number; incidentIds: string[]; detectedAt: string; outcome: string; detail?: string | null; attempt?: number; unrecoverable?: boolean; recoveredAt?: string | null }
 
 /** 校验失败原因的可读标签（取值由 host 侧 outcome 枚举决定）。 */
 const FAILURE_LABEL: Record<string, string> = {
@@ -286,6 +286,11 @@ function RadarPanel() {
   const { status, events, tasks, results, inventory, releases, failures, refresh } = useRadarData()
   const [refreshing, setRefreshing] = React.useState(false)
 
+  // 一次成功的纠错会让"已回收"的失败记录永久留在待办清单上，除非按 recoveredAt
+  // 把它们区分开（host 侧在该投递被接受时写入该字段）。
+  const unrecoveredFailures = failures.filter(f => f.recoveredAt == null)
+  const recoveredFailures = failures.filter(f => f.recoveredAt != null)
+
   const doRefresh = async () => {
     if (refreshing) return
     setRefreshing(true)
@@ -358,14 +363,18 @@ function RadarPanel() {
 
     // 到达但未被接受的答复：没有这个区块，被丢弃的结论在面板上完全不可见。
     // host 侧已对前两次失败自动补发纠错请求（attempt 1/2）；到第 3 次标 unrecoverable。
-    jsx('div', { style: styles.section, children: `未回收的答复（校验失败 ${failures.length}）` }),
-    failures.length === 0
+    // 已被纠错回收的条目不再计入"未回收"，只在尾部留一行弱化说明。
+    jsx('div', { style: styles.section, children: `未回收的答复（校验失败 ${unrecoveredFailures.length}）` }),
+    unrecoveredFailures.length === 0
       ? jsx('div', { style: styles.muted, children: '（无：所有投递要么已回收，要么仍在等待 agent 回复）' })
-      : jsxs('div', { children: failures.map((f) => jsxs('div', { style: styles.card, children: [
+      : jsxs('div', { children: unrecoveredFailures.map((f) => jsxs('div', { style: styles.card, children: [
           jsx('div', { style: styles.pkg, children: `⚠ ${FAILURE_LABEL[f.outcome] ?? f.outcome}${f.unrecoverable === true ? ' · 已放弃（纠错预算用尽）' : ` · 第 ${f.attempt ?? 1} 次`}` }),
           jsx('div', { style: styles.meta, children: `${(f.detectedAt ?? '').slice(0, 19)} · ${f.sessionId.slice(0, 28)} · seq=${f.assistantSeq}` }),
           jsx('div', { style: styles.meta, children: `incident: ${f.incidentIds.join(', ')}${f.detail ? ` · ${f.detail}` : ''}` }),
         ], }, `${f.sessionId}|${f.assistantSeq}`)) }),
+    recoveredFailures.length > 0
+      ? jsx('div', { style: styles.muted, children: `另有 ${recoveredFailures.length} 条已由纠正重试回收：${recoveredFailures.map(f => `${FAILURE_LABEL[f.outcome] ?? f.outcome}（第 ${f.attempt ?? 1} 次）`).join('、')}` })
+      : null,
 
     jsx('div', { style: styles.section, children: '装前审查（未安装的插件）' }),
     jsx(PreInstallSection, {}),

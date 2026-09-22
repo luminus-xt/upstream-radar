@@ -452,6 +452,8 @@ describe('bounded self-correction', () => {
     assert.equal(dropped.dropped[0]?.messageId, delivery.messageId)
     assert.deepEqual(dropped.dropped[0]?.taskIds, [delivery.taskRefs[0]?.taskId])
     const drop = dropped.dropped[0]!
+    // 回收标记按 deliveryId 匹配，丢弃记录必须带上这个投递的 id。
+    assert.equal(drop.deliveryId, delivery.id)
 
     // The host sends this back into the same session.
     const retry = createDshRadarRetryMessage(drop, drop.taskIds, drop.outcome, drop.detail, 1)
@@ -472,6 +474,9 @@ describe('bounded self-correction', () => {
     assert.equal(harvested.accepted.length, 1)
     assert.equal(harvested.state.analysisResults?.[event.incidentId]?.deliveryId, delivery.id)
     assert.equal(harvested.state.analysisDeliveries?.[delivery.id], undefined)
+    // 采纳时消费的投递 id 就是先前被丢弃答复所属的那个：host 侧据此把 sidecar
+    // 里那条"未回收"标成已回收。
+    assert.deepEqual(harvested.consumedDeliveryIds, [delivery.id])
   })
 
   it('retries twice, then gives up, and never retries a replayed answer', () => {

@@ -176,7 +176,9 @@ async function statusSummary(opts: RadarPanelOptions): Promise<unknown> {
     pendingTasks: Array.isArray(state.pendingAnalysisTasks) ? state.pendingAnalysisTasks.length : 0,
     deliveries: Object.keys(state.analysisDeliveries ?? {}).length,
     results: Object.keys(state.analysisResults ?? {}).length,
-    resultFailures: resultFailures.length,
+    // 与面板 "未回收的答复" 区块同口径：已被纠错回收的条目不算未回收，否则这里
+    // 会报出比面板更高的数字。
+    resultFailures: resultFailures.filter(failure => failure.recoveredAt === undefined).length,
     sourceHealth: Object.keys(state.sourceHealth ?? {}).length,
   } as Record<string, unknown>
 }
@@ -201,6 +203,9 @@ async function resultFailureList(opts: RadarPanelOptions): Promise<unknown[]> {
       detail: failure.detail ?? null,
       attempt: failure.attempt,
       unrecoverable: failure.unrecoverable === true,
+      // 非空 = 该投递后来的答复已通过校验（由纠正重试回收），面板据此把它从
+      // "未回收" 列表移出。记录本身保留，重放守卫依赖它。
+      recoveredAt: failure.recoveredAt ?? null,
     }))
 }
 

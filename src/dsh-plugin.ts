@@ -53,6 +53,7 @@ import {
 } from './dsh-analysis-result.js'
 import { ANALYSIS_EXPECTED_OUTPUT } from './dsh-analysis.js'
 import {
+  markAnalysisResultFailuresRecovered,
   readAnalysisResultFailures,
   recordAnalysisResultFailure,
   type AnalysisResultFailure,
@@ -1065,6 +1066,22 @@ export function apply(ctx: DshRadarContext, config: Config = {}): void {
         for (const deliveryId of outcome.consumedDeliveryIds) inFlightDeliveries.delete(deliveryId)
         if (outcome.accepted.length > 0) {
           ctx.logger.info(`upstream-radar: accepted ${outcome.accepted.length} verified DSH analysis result(s)`)
+          // This delivery produced a verdict, so any dropped answer recorded for
+          // it was recovered by the correction retry. Drop the "未回收" reading;
+          // the entry itself stays in place because it doubles as the replay
+          // guard. Diagnostic bookkeeping must never break the event path.
+          try {
+            const recovered = await markAnalysisResultFailuresRecovered(
+              stateFile,
+              new Set(outcome.consumedDeliveryIds),
+              outcome.accepted[0]?.receivedAt ?? new Date().toISOString(),
+            )
+            if (recovered > 0) {
+              ctx.logger.info(`upstream-radar: recovered ${recovered} dropped analysis answer(s) after correction`)
+            }
+          } catch (error: unknown) {
+            ctx.logger.warn(`upstream-radar: could not mark recovered dropped answers: ${safeMessage(error)}`)
+          }
         }
         for (const drop of outcome.dropped) {
           const detail = drop.detail === undefined ? '' : ` (${drop.detail})`

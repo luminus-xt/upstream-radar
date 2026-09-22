@@ -162,6 +162,17 @@ describe('radar-panel api', () => {
           outcome: 'contract-mismatch',
           detail: 'field=project_exposure',
           attempt: 2,
+        }, {
+          // 同一投递后来的答复已被接受 → 这条不再是"未回收"，但记录本身保留。
+          sessionId: 'session-recovered',
+          assistantSeq: 43,
+          deliveryId: 'delivery-2',
+          incidentIds: ['project\u0000npm-releases'],
+          detectedAt: '2026-09-12T00:22:44.000Z',
+          outcome: 'json-syntax-error',
+          detail: 'candidates=0',
+          attempt: 1,
+          recoveredAt: '2026-09-13T12:53:57.856Z',
         }],
       }))
 
@@ -170,15 +181,18 @@ describe('radar-panel api', () => {
 
       const statusRes = jsonResponse()
       await routes.find(r => r.path.endsWith('/api/status'))!.handler(req('GET'), statusRes)
+      // 与面板区块同口径：只数未回收的，不含上面那条已回收的。
       assert.equal((statusRes.result().body as Record<string, unknown>).resultFailures, 1)
 
       const failuresRes = jsonResponse()
       await routes.find(r => r.path.endsWith('/api/result-failures'))!.handler(req('GET'), failuresRes)
       const failures = (failuresRes.result().body as { failures: Array<Record<string, unknown>> }).failures
-      assert.equal(failures.length, 1)
-      assert.equal(failures[0]?.outcome, 'contract-mismatch')
-      assert.equal(failures[0]?.assistantSeq, 42)
-      assert.deepEqual(failures[0]?.incidentIds, ['project\u0000npm-releases'])
+      assert.equal(failures.length, 2)
+      const unrecovered = failures.find(entry => entry.assistantSeq === 42)
+      assert.equal(unrecovered?.outcome, 'contract-mismatch')
+      assert.deepEqual(unrecovered?.incidentIds, ['project\u0000npm-releases'])
+      assert.equal(unrecovered?.recoveredAt, null)
+      assert.equal(failures.find(entry => entry.assistantSeq === 43)?.recoveredAt, '2026-09-13T12:53:57.856Z')
     } finally {
       await rm(dir, { recursive: true, force: true })
     }

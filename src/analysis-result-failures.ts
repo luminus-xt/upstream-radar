@@ -34,6 +34,16 @@ export interface AnalysisResultFailure {
   attempt: number
   /** Set when the correction budget is exhausted and no retry was sent. */
   unrecoverable?: boolean
+  /**
+   * Set when a later answer for the SAME delivery was accepted, i.e. the
+   * correction retry recovered the verdict this entry was recording.
+   *
+   * The entry is marked rather than deleted on purpose: this log is also the
+   * replay guard in `decideAnalysisResultCorrection`, so a removed entry would
+   * let a re-delivered session event trigger a second correction. Only the
+   * "still unrecovered" reading changes.
+   */
+  recoveredAt?: string
 }
 
 export function analysisResultFailureLogPath(stateFile: string): string {
@@ -74,6 +84,10 @@ function parseFailure(value: unknown): AnalysisResultFailure | undefined {
   const attempt = failure.attempt
   if (typeof attempt !== 'number' || !Number.isSafeInteger(attempt) || attempt < 1 || attempt > 1_000) return undefined
   if (failure.unrecoverable !== undefined && typeof failure.unrecoverable !== 'boolean') return undefined
+  // Parsed explicitly: this log is read-modify-written on every record, so a
+  // field that is not reconstructed here would be silently dropped on the next
+  // write and the recovery mark would never survive.
+  if (failure.recoveredAt !== undefined && !boundedText(failure.recoveredAt, 256)) return undefined
   return {
     sessionId: failure.sessionId,
     assistantSeq,
@@ -85,6 +99,7 @@ function parseFailure(value: unknown): AnalysisResultFailure | undefined {
     ...(failure.detail === undefined ? {} : { detail: failure.detail }),
     attempt,
     ...(failure.unrecoverable === undefined ? {} : { unrecoverable: failure.unrecoverable }),
+    ...(failure.recoveredAt === undefined ? {} : { recoveredAt: failure.recoveredAt }),
   }
 }
 
@@ -110,6 +125,13 @@ function failureKey(failure: AnalysisResultFailure): string {
   return `${failure.sessionId}\u0000${failure.assistantSeq}`
 }
 
+async function writeFailures(stateFile: string, failures: readonly AnalysisResultFailure[]): Promise<void> {
+  const path = analysisResultFailureLogPath(stateFile)
+  const temporary = `${path}.tmp`
+  await writeFile(temporary, `${JSON.stringify({ schema: ANALYSIS_RESULT_FAILURES_SCHEMA, failures }, null, 2)}\n`, 'utf8')
+  await rename(temporary, path)
+}
+
 /** Record (or refresh) one dropped answer, keeping the newest entries. */
 export async function recordAnalysisResultFailure(
   stateFile: string,
@@ -120,8 +142,37 @@ export async function recordAnalysisResultFailure(
   const merged = [...existing.filter(entry => failureKey(entry) !== key), failure]
     .sort((left, right) => left.detectedAt.localeCompare(right.detectedAt))
   const failures = merged.slice(Math.max(0, merged.length - MAX_ANALYSIS_RESULT_FAILURES))
-  const path = analysisResultFailureLogPath(stateFile)
-  const temporary = `${path}.tmp`
-  await writeFile(temporary, `${JSON.stringify({ schema: ANALYSIS_RESULT_FAILURES_SCHEMA, failures }, null, 2)}\n`, 'utf8')
-  await rename(temporary, path)
+  await writeFailures(stateFile, failures)
+}
+
+/**
+ * Mark every dropped answer of the given deliveries as recovered.
+ *
+ * Called when a correction retry produced an accepted verdict for that
+ * delivery: the drop is then history, not outstanding work, and the panel must
+ * stop presenting it as "未回收". Entries are updated in place rather than
+ * removed so the replay guard in `decideAnalysisResultCorrection` still sees
+ * them.
+ *
+ * Returns how many entries were newly marked, so the caller can log a fact
+ * instead of a guess. A delivery with no recorded drop marks nothing.
+ */
+export async function markAnalysisResultFailuresRecovered(
+  stateFile: string,
+  deliveryIds: ReadonlySet<string>,
+  recoveredAt: string,
+): Promise<number> {
+  if (deliveryIds.size === 0) return 0
+  const existing = await readAnalysisResultFailures(stateFile)
+  if (existing.length === 0) return 0
+  let marked = 0
+  const failures = existing.map(entry => {
+    if (entry.recoveredAt !== undefined) return entry
+    if (entry.deliveryId === undefined || !deliveryIds.has(entry.deliveryId)) return entry
+    marked += 1
+    return { ...entry, recoveredAt }
+  })
+  if (marked === 0) return 0
+  await writeFailures(stateFile, failures)
+  return marked
 }
